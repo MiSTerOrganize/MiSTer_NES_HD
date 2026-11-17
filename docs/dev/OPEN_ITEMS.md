@@ -1056,7 +1056,7 @@ Status key: OPEN / IN PROGRESS / CLOSED (date, where documented).
       everywhere - CONF_STR setname NES_HD, games/NES_HD/, _Other/NES_HD_<date>.rbf, ARM daemon
       games/NES_HD/NES_HD, logs/NES_HD/. (NES_HDPack was briefly chosen the same day and
       dropped.) The pack collection lives in games/NES_HD/HD_Packs/ (user, 2026-10-29; the
-      handler creates it every launch). The GitHub repo is MiSTerOrganize/NES_HD_MiSTer
+      handler creates it every launch). The GitHub repo is MiSTerOrganize/MiSTer_NES_HD
       (renamed from NES_MiSTer 2026-10-29; the old URL redirects). The core is a MiSTer Frontier core: Master_Daemon spawns games/NES_HD/_handler.sh
       (in this repo) on CORENAME NES_HD, and the handler execs the daemon. Own setname =
       no CORENAME collision with the stock NES core; saves/configs separate from stock NES.

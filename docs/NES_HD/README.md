@@ -47,7 +47,7 @@ time the core loads.
 
 The packs are too large for the repo itself (the full collection is 5.19 GB, and several single packs are
 over GitHub's 100 MB file limit), so they are attached to the
-**[HD Packs release](https://github.com/MiSTerOrganize/NES_HD_MiSTer/releases/tag/hd-packs)**:
+**[HD Packs release](https://github.com/MiSTerOrganize/MiSTer_NES_HD/releases/tag/hd-packs)**:
 
 - **One zip per pack.** Download only the games you want. Each zip holds a single `.hdp` file.
 - **The whole collection** as `NES_HD Packs (part 1 of 2).zip` and `(part 2 of 2).zip`. Each part already

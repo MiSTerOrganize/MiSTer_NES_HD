@@ -1,7 +1,7 @@
-"""publish_repo.py - assemble the public NES_HD_MiSTer layout (the MiSTer Frontier hybrid-core
+"""publish_repo.py - assemble the public MiSTer_NES_HD layout (the MiSTer Frontier hybrid-core
 shape, same as MiSTer_PICO-8 / MiSTer_OpenBOR_7533) from this dev workspace.
 
-    python publish_repo.py <clone of NES_HD_MiSTer> [--apply]
+    python publish_repo.py <clone of MiSTer_NES_HD> [--apply]
 
 Dry run by default: prints what it would copy. --apply writes into the clone's working tree
 (git mv for the upstream files on the first run, then plain copies); committing is left to you.
