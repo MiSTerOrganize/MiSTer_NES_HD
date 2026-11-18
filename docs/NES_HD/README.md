@@ -12,7 +12,7 @@ HD pack engine runs on the MiSTer's ARM CPU and draws each tile and sprite the w
 
 - The FPGA build closes timing with every slack positive; the smallest is +0.138 ns, on the HDMI clock.
 - The core's MiSTer framework (`fpga/sys`) is one Template_MiSTer update behind and will be refreshed.
-- All 123 packs in the collection have been converted and checked on a PC, and are installed on the
+- All 124 packs in the collection have been converted and checked on a PC, and are installed on the
   developer's MiSTer for hardware testing. Report anything that looks or sounds wrong.
 - On the heaviest packs a frame's HD graphics are occasionally not ready in time. When that happens
   the previous picture is shown again for one frame (1/60 of a second) instead of a black frame.
@@ -97,7 +97,7 @@ problem.
 
 ## ROMs needed
 
-49 ROMs cover all 123 packs. Sizes are the full file including the 16-byte header. 44 of them match the
+49 ROMs cover all 124 packs. Sizes are the full file including the 16-byte header. 44 of them match the
 No-Intro NES DAT (headered) exactly; a note on each of the other five says where it comes from.
 
 **(F1140) Dig Dug.nes**
@@ -234,7 +234,7 @@ No-Intro NES DAT (headered) exactly; a note on each of the other five says where
 - Size: 24,592 bytes
 - MD5: `1C2B01E982667D7BA723988C771D88FA`
 - SHA-1: `F5B310E71129315192C28EF457DA16D5FB1BC91E`
-- Packs (3): Duck Hunt (World) [Audio], Duck Hunt (World) [HD v1.1], Duck Hunt (World)
+- Packs (4): Duck Hunt (World) [Audio], Duck Hunt (World) [HD v1.1], Duck Hunt (World) [NEA Audio], Duck Hunt (World)
 
 **Faxanadu (USA).nes**
 
@@ -524,6 +524,7 @@ newer.
 - main pack: Duck Hunt HD v1.1 with NEA audio
 - `HD v1.1`: Duck Hunt HD v1.1, Aclectico and GBAGuy007
 - `Audio`: NEA audio, LiQuiDz and Cubear (HDnes repository)
+- `NEA Audio`: NEA audio (the HDnes repository's NEA build), LiQuiDz and Cubear
 
 **Faxanadu** - Faxanadu: Revisioned v1.26, Altwolf.
 
