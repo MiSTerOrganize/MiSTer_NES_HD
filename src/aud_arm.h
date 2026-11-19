@@ -103,6 +103,9 @@ typedef struct {
     int n_ent;
     aud_ent ent[AUD_MAXENT];
     int album, options, paused, bvol, svol;
+    /* the pause menu's MUSIC VOLUME / SFX VOLUME, 0..10 (10 = the pack's own level); set by the
+       caller, never by a pack or a reset (aud_init sets 10) */
+    int user_bvol, user_svol;
     aud_voice bgm;
     aud_voice sfx[AUD_SFX];
     int n_sfx;

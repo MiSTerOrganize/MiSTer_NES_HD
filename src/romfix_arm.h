@@ -71,6 +71,12 @@ uint32_t rf_build(const uint8_t *s14, uint32_t s14_len, const uint8_t *e, const 
                   uint32_t L, int p2, uint8_t *tgt, int *why);
 
 void rf_sha1(const uint8_t *d, size_t n, uint8_t out[20]);
+
+/* 1 when section 14 has an entry for this ROM - its whole-file SHA1 (sha_raw), its iNES 1.0
+   form (sha_n, NULL when the file has no such form) or a patch rule over rom[0..L) - the same
+   three tries rf_decide makes, so the pause menu's pack list and the patcher agree. */
+int rf_match(const uint8_t *s14, uint32_t s14_len, const uint8_t *rom, uint32_t L,
+             const uint8_t sha_raw[20], const uint8_t *sha_n);
 #ifdef __cplusplus
 }
 #endif

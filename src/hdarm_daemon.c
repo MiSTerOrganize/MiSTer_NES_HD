@@ -130,6 +130,22 @@ static void copy_aligned(volatile uint8_t *base, uint32_t off, uint32_t len, uin
     }
 }
 static void pk_drop(void);
+/* The running ROM's two SHA1s (raw, and iNES 1.0 form when that differs), as the ROM patcher
+   hashed them at its download; the pause menu's pack list matches packs against them. */
+static pthread_mutex_t g_rom_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t g_rom_raw[20], g_rom_n[20];
+static int g_rom_known, g_rom_ncand;
+static uint8_t *g_rom_bytes;                             /* the file too, for patch rules */
+static uint32_t g_rom_len;
+static void rom_id_set(const rf_state *st, const uint8_t *rom, uint32_t L) {
+    pthread_mutex_lock(&g_rom_lock);
+    memcpy(g_rom_raw, st->sha_raw, 20); memcpy(g_rom_n, st->sha_n, 20);
+    g_rom_ncand = st->n_cand; g_rom_known = 1;
+    if (!g_rom_bytes) g_rom_bytes = malloc(RF_MAXB);
+    g_rom_len = g_rom_bytes ? L : 0;
+    if (g_rom_bytes) memcpy(g_rom_bytes, rom, L);
+    pthread_mutex_unlock(&g_rom_lock);
+}
 static uint8_t last_rom_sha[20];                         /* the game the pack was loaded under */
 static int last_rom_known;
 static void romfix_service(rf_state *st, uint8_t *rom, uint8_t *tgt) {
@@ -177,6 +193,7 @@ static void romfix_service(rf_state *st, uint8_t *rom, uint8_t *tgt) {
         if (last_rom_known && memcmp(last_rom_sha, st->sha_raw, 20)) pk_drop();
         memcpy(last_rom_sha, st->sha_raw, 20);
         last_rom_known = 1;
+        rom_id_set(st, rom, L);                          /* for the pause menu's pack list */
     }
 }
 
@@ -202,6 +219,7 @@ static void *service(void *arg) {
  * and the thread renders whatever has become due every 2 ms. Window qwords are mapped from three
  * places: the status qword beside the mailbox, the event log + PCM slots at 0x3D000000, and the
  * pack (file bytes below 192 MB at 0x30000000, the rest in the overflow window at 0x24000000). */
+static volatile int g_user_bvol = 10, g_user_svol = 10;  /* set by the pause menu thread */
 #define AUD_PA   0x3D000000u                             /* event log; PCM slots at + 0x10000 */
 #define AUD_LEN  0x00050000u
 #define OVF_PA   0x24000000u                             /* pack file bytes >= 192 MB */
@@ -256,6 +274,8 @@ static void *audio(void *arg) {
     uint32_t restarts = 0, resets = 0;
     int started = 0;
     while (!g_stop) {
+        a.user_bvol = g_user_bvol;                       /* the pause menu's volumes, 0..10 */
+        a.user_svol = g_user_svol;
         aud_service(&a, &io);
         int restart = a.started != started || a.restarts != restarts;
         if (restart) {
@@ -562,6 +582,626 @@ static void *pacer(void *arg) {
     return NULL;
 }
 
+/* ------------------------------------------------------------------ the pause menu thread
+ * The file jobs of the pause menu (rtl/pmenu_ctl.sv; the link and the qwords are documented at
+ * the top of rtl/pmenu_link.sv, the design in PAUSE_MENU_DESIGN.md). On core 1, every 20 ms:
+ * the heartbeat (every 100 ms), the menu's volumes into the audio thread, a new request
+ * (sequence changed) carried out and answered, the take being recorded copied out of tas_rec's
+ * ring, and the replay header disarmed once the replay has started.
+ *
+ *   LIST     the packs in HD_PACKS (any depth) for the running ROM, names into entries 0..14
+ *   LOAD     load list entry arg (the .s1 copy path, on its own thread so the heartbeat runs)
+ *   RECORD   slot arg[2:0]+1; arg[3]: the take restarts after a reset already made
+ *   STOP     write the take; DISCARD drop it; QUIT (arg[0]: drop the take) reload the core
+ *            and open the OSD
+ *   PLAY     check slot arg[2:0]+1, write it into tas_play and arm it
+ *
+ * A take, /media/fat/replays/NES_HD/<game>_<slot>.inp, is tas_save.py's NESTAS2 file (32-byte
+ * header, 16-byte frame records from frame 1, no RAM snapshots) - every tools/tas/ reader and
+ * the Mesen replay take it as it is - followed by a trailer the PC tools ignore:
+ *   "NHDTAKE1"  u32 take version  u32 save bytes  char game[64]  save bytes  u32 CRC-32 of the
+ *   whole file before it.
+ * The save bytes are the game's .sav as it was on the card when Record was chosen. */
+#include <dirent.h>
+#include <strings.h>
+#include <sys/ioctl.h>
+#include <linux/uinput.h>
+#include "pmenu_notices.h"
+
+#define PM_MREQ    0x70
+#define PM_MRSP    0x78
+#define PM_NAMES   0x100
+#define TREC_PA    0x3D080000u     /* tas_rec header: q0 frame/session, q1 ROM CRC/replay state */
+#define TENT_PA    0x3D500000u     /* tas_rec records: frame n at + 16 * (n mod TRING) */
+#define TRING      (1u << 18)      /* also the longest take: tas_play holds 2^18 entries */
+#define TPLAY_PA   0x3D0A0000u     /* tas_play header */
+#define TPENT_PA   0x3D100000u     /* tas_play entries */
+#ifndef REPLAYS_ROOT                /* tools/armdec/test_pmenu.c points these at a scratch folder */
+#define REPLAYS_ROOT "/media/fat/replays"
+#define HD_PACKS   "/media/fat/games/NES_HD/HD_Packs"
+#endif
+#define REPLAYS    REPLAYS_ROOT "/NES_HD"
+/* Take versions: 1 = the save is the card's .sav at Record; 2 = the save is the battery RAM the
+   core copied out at the Record reset (rtl/bat_xfer.sv). Both replay the same way: with a core
+   that copies saves, Play loads the take's save into the game at the Play reset. Bump only when
+   old takes would replay differently. */
+#define TAKE_VER   2u
+#define BAT_PA     0x3E000000u     /* bat_xfer OUT: header, then the save from + 8 */
+#define BAT_IN     0x200000u       /* bat_xfer IN at BAT_PA + this, same layout */
+#define BAT_MAP    0x281000u
+#define BAT_MAGIC  0xB7A5u
+#define BAT_MAX    0x80000u        /* the largest save the core copies (512 KB PRG flash) */
+#define SAVE_MAX   0x100000u
+#define NPACK      15
+
+enum { A_LIST = 1, A_LOAD = 2, A_RECORD = 4, A_STOP = 5, A_PLAY = 6, A_QUIT = 7, A_DISCARD = 8 };
+
+static volatile uint8_t *g_trec, *g_tent, *g_tplay, *g_tpent, *g_bat;
+
+/* MREQ [36]: the core copies battery saves; [38:37] its kind for this game (0 = none it can) */
+static int core_copies_save(void) {
+    uint64_t m = rd64(g_mbox + PM_MREQ);
+    return (m >> 56) == 0x4D && ((m >> 36) & 1) && ((m >> 37) & 3);
+}
+
+static uint32_t crc32z(uint32_t c, const uint8_t *d, size_t n) {      /* zlib's CRC-32 */
+    c = ~c;
+    while (n--) { c ^= *d++; for (int k = 0; k < 8; k++) c = c >> 1 ^ (0xEDB88320u & -(c & 1)); }
+    return ~c;
+}
+
+/* MiSTer's own process: its argv[1] is the RBF, its open .sav names the game */
+static int mister_pid(void) {
+    DIR *d = opendir("/proc");
+    struct dirent *e;
+    int pid = 0;
+    while (d && !pid && (e = readdir(d))) {
+        if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        char p[300], c[32] = {0};
+        snprintf(p, sizeof p, "/proc/%s/comm", e->d_name);
+        int fd = open(p, O_RDONLY);
+        if (fd < 0) continue;
+        ssize_t n = read(fd, c, sizeof c - 1);
+        close(fd);
+        if (n > 0 && !strncmp(c, "MiSTer\n", 7)) pid = atoi(e->d_name);
+    }
+    if (d) closedir(d);
+    return pid;
+}
+
+/* the save MiSTer mounted for the running game (it keeps the file open), or 0 */
+static int game_save(char *out, size_t n) {
+#ifdef PM_TEST
+    const char *t = getenv("PM_TEST_SAV");            /* the test names the "open" save */
+    if (t && *t) { snprintf(out, n, "%s", t); return 1; }
+    return 0;
+#endif
+    int pid = mister_pid();
+    if (!pid) return 0;
+    char dir[64];
+    snprintf(dir, sizeof dir, "/proc/%d/fd", pid);
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    int found = 0;
+    while (d && !found && (e = readdir(d))) {
+        char p[384], t[1024];
+        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        ssize_t l = readlink(p, t, sizeof t - 1);
+        if (l <= 0) continue;
+        t[l] = 0;
+        if (!strncmp(t, "/media/fat/saves/", 17) && l > 4 && !strcasecmp(t + l - 4, ".sav")) {
+            snprintf(out, n, "%s", t); found = 1;
+        }
+    }
+    if (d) closedir(d);
+    return found;
+}
+
+/* the take name for the running game: its save's name, or rom_<CRC> when it has none */
+static void game_name(char *out, size_t n, uint32_t crc) {
+    char s[1024];
+    if (game_save(s, sizeof s)) {
+        const char *b = strrchr(s, '/') + 1;
+        size_t l = strlen(b) - 4;
+        if (l >= n) l = n - 1;
+        memcpy(out, b, l); out[l] = 0;
+    } else {
+        snprintf(out, n, "rom_%08X", crc);
+    }
+}
+
+static void take_path(char *out, size_t n, const char *game, int slot) {
+    snprintf(out, n, REPLAYS "/%s_%d.inp", game, slot);
+}
+
+static uint8_t slots_used(const char *game) {
+    uint8_t m = 0;
+    for (int k = 1; k <= 8; k++) {
+        char p[1200]; struct stat st;
+        take_path(p, sizeof p, game, k);
+        if (!stat(p, &st) && st.st_size > 0) m |= 1u << (k - 1);
+    }
+    return m;
+}
+
+static uint8_t *read_file(const char *path, uint32_t max, uint32_t *len) {
+    int fd = open(path, O_RDONLY);
+    struct stat st;
+    if (fd < 0) return NULL;
+    if (fstat(fd, &st) || st.st_size < 0 || (uint64_t)st.st_size > max) { close(fd); return NULL; }
+    uint8_t *b = malloc(st.st_size ? st.st_size : 1);
+    uint32_t got = 0;
+    while (b && got < (uint32_t)st.st_size) {
+        ssize_t r = read(fd, b + got, st.st_size - got);
+        if (r <= 0) { free(b); b = NULL; break; }
+        got += (uint32_t)r;
+    }
+    close(fd);
+    if (b) *len = got;
+    return b;
+}
+
+/* a name entry (32 bytes, 30 characters 0x20-0x7E, the rest spaces) */
+static void put_name(int entry, const char *s) {
+    uint8_t b[32];
+    memset(b, ' ', 32);
+    for (int i = 0; i < 30 && s[i]; i++) b[i] = (s[i] >= 0x20 && s[i] <= 0x7E) ? s[i] : ' ';
+    for (int q = 0; q < 4; q++) {
+        uint64_t v; memcpy(&v, b + 8 * q, 8);
+        wr64(g_mbox + PM_NAMES + 32 * entry + 8 * q, v);
+    }
+}
+
+/* ---- the pack list ---- */
+static char g_pack[NPACK][1024];
+static int g_npack;
+static uint8_t g_listgen;
+
+/* is the pack at path for the running ROM? Its header's ROM list (hdp3_convert rom_ids) or its
+   ROM patches (section 14: whole-file SHA1s and patch rules, as the ROM patcher matches them) */
+static int pack_matches(const char *path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    uint8_t h[0x200];
+    int ok = 0;
+    if (read(fd, h, sizeof h) == (ssize_t)sizeof h && !memcmp(h, "NHDP", 4)) {
+        pthread_mutex_lock(&g_rom_lock);
+        if (!memcmp(h + 0x110, "RH", 2))
+            for (int i = 0; i < h[0x112] && i < 11 && !ok; i++) {
+                const uint8_t *s = h + 0x114 + 20 * i;
+                ok = !memcmp(s, g_rom_raw, 20) || (g_rom_ncand && !memcmp(s, g_rom_n, 20));
+            }
+        uint32_t o14 = le32(h + 0xF0), n14 = le32(h + 0xF4);
+        if (!ok && n14 >= 64 && n14 <= 0x400000) {
+            uint8_t *s14 = malloc(n14);
+            if (s14 && pread(fd, s14, n14, o14) == (ssize_t)n14)
+                ok = rf_match(s14, n14, g_rom_bytes, g_rom_len, g_rom_raw,
+                              g_rom_ncand ? g_rom_n : NULL);
+            free(s14);
+        }
+        pthread_mutex_unlock(&g_rom_lock);
+    }
+    close(fd);
+    return ok;
+}
+
+static int pack_cmp(const void *a, const void *b) {
+    const char *x = strrchr((const char *)a, '/'), *y = strrchr((const char *)b, '/');
+    return strcasecmp(x ? x + 1 : a, y ? y + 1 : b);
+}
+
+static void scan_packs(const char *dir, int depth) {
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    while (d && (e = readdir(d)) && g_npack < NPACK) {
+        if (e->d_name[0] == '.') continue;
+        char p[1024];
+        if (snprintf(p, sizeof p, "%s/%s", dir, e->d_name) >= (int)sizeof p) continue;
+        struct stat st;
+        if (stat(p, &st)) continue;
+        size_t l = strlen(e->d_name);
+        if (S_ISDIR(st.st_mode)) { if (depth < 4) scan_packs(p, depth + 1); }
+        else if (l > 4 && !strcasecmp(e->d_name + l - 4, ".hdp") && pack_matches(p))
+            snprintf(g_pack[g_npack++], sizeof g_pack[0], "%s", p);
+    }
+    if (d) closedir(d);
+}
+
+static void list_packs(void) {
+    g_npack = 0;
+    pthread_mutex_lock(&g_rom_lock);
+    int known = g_rom_known;
+    pthread_mutex_unlock(&g_rom_lock);
+    if (known) scan_packs(HD_PACKS, 0);
+    qsort(g_pack, g_npack, sizeof g_pack[0], pack_cmp);
+    for (int i = 0; i < g_npack; i++) {
+        char nm[64];
+        const char *b = strrchr(g_pack[i], '/') + 1;
+        size_t l = strlen(b) - 4;
+        if (l >= sizeof nm) l = sizeof nm - 1;
+        memcpy(nm, b, l); nm[l] = 0;
+        put_name(i, nm);
+    }
+    g_listgen++;
+    fprintf(stderr, "hdarm: pause menu: %d HD pack(s) for this ROM\n", g_npack);
+}
+
+static volatile int g_pack_loading;
+static void *pack_load_thread(void *arg) {
+    char *path = arg;
+    load_pack_file(path, -1);
+    free(path);
+    g_pack_loading = 0;
+    return NULL;
+}
+
+/* ---- the take ---- */
+static struct {
+    int on, pending;               /* capturing; waiting for the Record reset */
+    uint32_t sess0, sess, next;    /* session before the reset, the take's, next frame wanted */
+    uint64_t *buf;                 /* q0,q1 per frame, from frame 1 */
+    uint32_t n;
+    int limit, lost;
+    int slot;
+    uint32_t crc;
+    char game[64];
+    uint8_t *save; uint32_t save_len;
+    int bat_wait;                  /* waiting for the core's copy of the save (bat_xfer OUT) */
+    int bat_seq;                   /* OUT sequence already taken (-1: none) */
+    int from_core;                 /* the save came from the core: take version 2 */
+} R;
+
+/* the core's copy of the save after the Record reset: a new OUT header replaces the card's .sav
+   read at Record (status 1); status 2 (nothing the core can copy) keeps the card's */
+static void take_bat(void) {
+    if (!R.on || !R.bat_wait) return;
+    uint64_t h = rd64(g_bat);
+    if ((h >> 48) != BAT_MAGIC || (int)((h >> 32) & 0xFF) == R.bat_seq) return;
+    __sync_synchronize();                                /* the header is written last */
+    unsigned st = (h >> 40) & 0xFF;
+    uint32_t len = (uint32_t)h;
+    R.bat_wait = 0; R.bat_seq = (int)((h >> 32) & 0xFF);
+    if (st != 1 || len > BAT_MAX) return;
+    uint8_t *s = len ? malloc(len) : NULL;
+    if (len && !s) return;                               /* keep the card's */
+    for (uint32_t i = 0; i < len; i += 8) {
+        uint64_t q = rd64(g_bat + 8 + i);
+        memcpy(s + i, &q, len - i < 8 ? len - i : 8);
+    }
+    free(R.save);
+    R.save = s; R.save_len = len; R.from_core = 1;
+}
+
+static void take_drop(void) {
+    R.on = R.pending = 0; R.n = 0; free(R.save); R.save = NULL; R.save_len = 0;
+    R.bat_wait = 0; R.from_core = 0;
+}
+
+/* start (or restart, after a reset) a take: frames from 1. The save: the card's .sav now, replaced
+   by the core's copy of its battery RAM taken at the reset when the core makes one (take_bat). */
+static int take_start(int slot, int after_reset) {
+    uint64_t q0 = rd64(g_trec), q1 = rd64(g_trec + 8);
+    if (q0 >> 48 != 0x7A5C || !R.buf) return PMN_RECFAIL;
+    uint32_t S = (uint32_t)(q0 >> 32) & 0xFFFF;
+    char sav[1024];
+    uint8_t *save = NULL; uint32_t sl = 0;
+    if (game_save(sav, sizeof sav) && !(save = read_file(sav, SAVE_MAX, &sl))) return PMN_PREPFAIL;
+    int was = R.on && after_reset ? (int)R.sess : -1;
+    /* Record: the reset (and the copy) comes after this answer, so an old header is cleared and
+       any header seen later is the new copy. A restart: the copy may already be there, so the
+       one to wait for is any header other than the one this take already took. */
+    int seq0 = -1;
+    if (was >= 0) seq0 = R.bat_wait ? -1 : R.bat_seq;
+    else wr64(g_bat, 0);
+    take_drop();
+    R.save = save; R.save_len = save ? sl : 0;
+    R.bat_wait = core_copies_save(); R.bat_seq = seq0;
+    R.on = 1; R.slot = slot; R.crc = (uint32_t)q1; R.limit = R.lost = 0;
+    game_name(R.game, sizeof R.game, R.crc);
+    if (after_reset && was >= 0 && S != (uint32_t)was) { R.sess = S; R.next = 1; }   /* reset seen */
+    else { R.pending = 1; R.sess0 = S; }
+    return 0;
+}
+
+static void take_capture(void) {
+    if (!R.on) return;
+    take_bat();
+    uint64_t q0 = rd64(g_trec);
+    if (q0 >> 48 != 0x7A5C) return;
+    uint32_t F = (uint32_t)q0, S = (uint32_t)(q0 >> 32) & 0xFFFF;
+    if (R.pending) {
+        if (S == R.sess0) return;
+        R.pending = 0; R.sess = S; R.next = 1; R.n = 0;
+    }
+    if (S != R.sess) return;                  /* another reset: the menu re-sends RECORD/DISCARD */
+    if (F >= R.next + TRING) R.lost = 1;      /* the ring went round past us */
+    while (R.next <= F) {
+        if (R.n >= TRING) { R.limit = 1; break; }
+        volatile uint8_t *p = g_tent + (size_t)(R.next % TRING) * 16;
+        uint64_t a = rd64(p), b = rd64(p + 8);
+        if ((uint32_t)a != R.next || (a >> 59) != 0x16) break;     /* not written yet */
+        R.buf[2 * R.n] = a; R.buf[2 * R.n + 1] = b;
+        R.n++; R.next++;
+    }
+}
+
+static int write_all(int fd, const void *d, size_t n, uint32_t *crc) {
+    *crc = crc32z(*crc, d, n);
+    for (const uint8_t *p = d; n; ) {
+        ssize_t w = write(fd, p, n);
+        if (w <= 0) return 1;
+        p += w; n -= (size_t)w;
+    }
+    return 0;
+}
+
+/* Stop: the notice to show */
+static int take_stop(int *result) {
+    *result = 0;
+    take_capture();
+    if (!R.on || R.pending || !R.n) { take_drop(); return PMN_NOTHING; }
+    char p[1200], part[1210];
+    take_path(p, sizeof p, R.game, R.slot);
+    snprintf(part, sizeof part, "%s.part", p);
+    struct stat st;
+    int existed = !stat(p, &st);
+    mkdir(REPLAYS_ROOT, 0755); mkdir(REPLAYS, 0755);
+    int fd = open(part, O_WRONLY | O_CREAT | O_TRUNC, 0644), bad = fd < 0;
+    uint32_t c = 0;
+    if (!bad) {
+        uint8_t h[32] = "NESTAS2";
+        uint32_t f[6] = { R.n, R.sess, R.crc, 0, (uint32_t)(R.limit << 1 | R.lost << 2), 0 };
+        memcpy(h + 8, f, 24);
+        uint8_t t[80] = "NHDTAKE1";
+        uint32_t tv[2] = { R.from_core ? 2u : 1u, R.save_len };
+        memcpy(t + 8, tv, 8);
+        memcpy(t + 16, R.game, strnlen(R.game, 63));   /* the rest of t is zero */
+        bad = write_all(fd, h, 32, &c) || write_all(fd, R.buf, (size_t)R.n * 16, &c) ||
+              write_all(fd, t, 80, &c) || (R.save_len && write_all(fd, R.save, R.save_len, &c));
+        uint32_t cc = c, dummy = 0;
+        bad = bad || write_all(fd, &cc, 4, &dummy) || fsync(fd);
+        if (close(fd)) bad = 1;
+    }
+    if (bad || rename(part, p)) {
+        unlink(part);
+        fprintf(stderr, "hdarm: pause menu: cannot write %s\n", p);
+        take_drop(); *result = 1; return PMN_SAVEFAIL;
+    }
+    fprintf(stderr, "hdarm: pause menu: saved %s (%u frames, %u save bytes)\n", p, R.n, R.save_len);
+    int limit = R.limit;
+    take_drop();
+    return limit ? PMN_LIMIT : existed ? PMN_REPLACED : PMN_SAVED;
+}
+
+/* ---- play ---- */
+static double g_armed_at;          /* the replay header was armed at; 0 = not armed by us */
+static int g_seen_armed;
+
+static int take_play(int slot, int *result) {
+    *result = 1;
+    uint64_t q1 = rd64(g_trec + 8);
+    char game[64], p[1200];
+    game_name(game, sizeof game, (uint32_t)q1);
+    take_path(p, sizeof p, game, slot);
+    struct stat st;
+    if (stat(p, &st)) return PMN_EMPTY;
+    uint32_t L;
+    uint8_t *d = read_file(p, 32 + TRING * 16 + 84 + SAVE_MAX, &L);
+    if (!d) return PMN_NOOPEN;
+    int why = 0;
+    uint32_t n = 0, sl = 0, ver = 0, crc = 0;
+    if (L < 32 || memcmp(d, "NESTAS2", 8)) why = PMN_INVALID;
+    if (!why) { memcpy(&n, d + 8, 4); memcpy(&crc, d + 16, 4); }
+    if (!why && (n == 0 || n > TRING)) why = PMN_INVALID;
+    size_t t = 32 + (size_t)n * 16;
+    if (!why && L < t + 84) why = PMN_TRUNC;
+    if (!why && memcmp(d + t, "NHDTAKE1", 8)) why = PMN_INVALID;
+    if (!why) { memcpy(&ver, d + t + 8, 4); memcpy(&sl, d + t + 12, 4); }
+    if (!why && sl > SAVE_MAX) why = PMN_INVALID;
+    if (!why && L < t + 80 + sl + 4) why = PMN_TRUNC;
+    if (!why && L > t + 80 + sl + 4) why = PMN_INVALID;
+    if (!why) {
+        uint32_t want; memcpy(&want, d + L - 4, 4);
+        if (crc32z(0, d, L - 4) != want) why = PMN_DAMAGED;
+    }
+    if (!why && ver > TAKE_VER) why = PMN_NEWER;
+    if (!why && ver < 1) why = PMN_OLDER;
+    if (!why && !crc) why = PMN_NOGAME;
+    if (!why && crc != (uint32_t)q1) {
+        char nm[65] = {0};
+        memcpy(nm, d + t + 16, 64);
+        put_name(15, nm);
+        why = PMN_NEEDS;
+    }
+    int load_save = !why && core_copies_save() && sl <= BAT_MAX;
+    if (!why && sl && !load_save) {
+        /* A core that cannot load a save (an older RBF, or a game it cannot copy, such as FDS):
+           the replay starts from the battery RAM the game has now, so refuse unless the card's
+           .sav is the take's (else the replay would desync). */
+        char sav[1024]; uint32_t cl = 0;
+        uint8_t *cur = game_save(sav, sizeof sav) ? read_file(sav, SAVE_MAX, &cl) : NULL;
+        if (!cur || cl != sl || memcmp(cur, d + t + 80, sl)) why = PMN_RESTFAIL;
+        free(cur);
+    }
+    if (why) { free(d); return why; }
+    if (load_save) {                                     /* bat_xfer IN: loaded at the Play reset */
+        volatile uint8_t *in = g_bat + BAT_IN;
+        wr64(in, 0);
+        for (uint32_t i = 0; i < sl; i += 8) {
+            uint64_t q = 0;
+            memcpy(&q, d + t + 80 + i, sl - i < 8 ? sl - i : 8);
+            wr64(in + 8 + i, q);
+        }
+        __sync_synchronize();
+        wr64(in, (uint64_t)BAT_MAGIC << 48 | 3ull << 40 | sl);
+    }
+    volatile uint8_t *hd = g_tplay;
+    uint64_t old = rd64(hd + 8);
+    uint64_t gen = (((old >> 32) & 0xFF) % 255) + 1;
+    wr64(hd + 16, 0);                                    /* disarmed while it changes */
+    __sync_synchronize();
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t q0; memcpy(&q0, d + 32 + 16 * (size_t)i, 8);
+        wr64(g_tpent + 16 * (size_t)i, q0);
+        wr64(g_tpent + 16 * (size_t)i + 8, 0);
+    }
+    __sync_synchronize();
+    wr64(hd, 0x3159414C5053454Eull);                     /* "NESPLAY1" */
+    wr64(hd + 8, n | gen << 32);                         /* frame mode */
+    __sync_synchronize();
+    wr64(hd + 16, 1);
+    g_armed_at = now_ms(); g_seen_armed = 0;
+    fprintf(stderr, "hdarm: pause menu: playing %s (%u frames)\n", p, n);
+    free(d);
+    *result = 0;
+    return 0;
+}
+
+/* One shot, as tas_load.py: a freshly loaded core arms from any armed header, so it is disarmed
+   once the player has taken it (it went armed, then left armed) or after 20 s. */
+static void play_disarm_check(void) {
+    if (!g_armed_at) return;
+    unsigned s = (unsigned)(rd64(g_trec + 8) >> 32) & 7;
+    if (s == 1) g_seen_armed = 1;
+    if ((g_seen_armed && s != 1) || now_ms() - g_armed_at > 20000) {
+        wr64(g_tplay + 16, 0);
+        g_armed_at = 0;
+    }
+}
+
+/* ---- quit: reload the core (no game), then open the OSD with a key press ---- */
+static int g_kbd = -1;
+static void kbd_open(void) {
+    int fd = open("/dev/uinput", O_WRONLY | O_NONBLOCK);
+    if (fd < 0) return;
+    struct uinput_setup us;
+    memset(&us, 0, sizeof us);
+    us.id.bustype = BUS_VIRTUAL; us.id.vendor = 0x1209; us.id.product = 0xBEF0;
+    snprintf(us.name, sizeof us.name, "NES HD helper keys");
+    if (ioctl(fd, UI_SET_EVBIT, EV_KEY) || ioctl(fd, UI_SET_KEYBIT, KEY_F12) ||
+        ioctl(fd, UI_DEV_SETUP, &us) || ioctl(fd, UI_DEV_CREATE)) { close(fd); return; }
+    g_kbd = fd;                     /* made at start: MiSTer takes a new device after some seconds */
+}
+static void kbd_tap(int key) {
+    if (g_kbd < 0) return;
+    struct input_event ev[4];
+    memset(ev, 0, sizeof ev);
+    ev[0].type = EV_KEY; ev[0].code = key; ev[0].value = 1;
+    ev[1].type = EV_SYN;
+    ev[2].type = EV_KEY; ev[2].code = key; ev[2].value = 0;
+    ev[3].type = EV_SYN;
+    if (write(g_kbd, ev, 2 * sizeof ev[0]) < 0) return;
+    usleep(80000);
+    if (write(g_kbd, ev + 2, 2 * sizeof ev[0]) < 0) return;
+}
+
+static double g_quit_at, g_osd_at;
+static void quit_step(void) {
+    if (g_quit_at && now_ms() >= g_quit_at) {
+        g_quit_at = 0;
+        char rbf[1024] = {0}, p[64];
+        int pid = mister_pid();
+        snprintf(p, sizeof p, "/proc/%d/cmdline", pid);
+        int fd = pid ? open(p, O_RDONLY) : -1;
+        char cl[2048];
+        ssize_t n = fd >= 0 ? read(fd, cl, sizeof cl - 1) : -1;
+        if (fd >= 0) close(fd);
+        if (n > 0) {
+            cl[n] = 0;
+            const char *a1 = cl + strlen(cl) + 1;       /* argv[1] */
+            if (a1 < cl + n && *a1) snprintf(rbf, sizeof rbf, "%s%s", *a1 == '/' ? "" : "/media/fat/", a1);
+        }
+        int c = rbf[0] ? open("/dev/MiSTer_cmd", O_WRONLY | O_NONBLOCK) : -1;
+        if (c >= 0) {
+            dprintf(c, "load_core %s\n", rbf);
+            close(c);
+            g_osd_at = now_ms() + 3000;
+            fprintf(stderr, "hdarm: pause menu: quit, reloading %s\n", rbf);
+        } else {
+            fprintf(stderr, "hdarm: pause menu: quit: cannot reload the core\n");
+        }
+    }
+    if (g_osd_at && now_ms() >= g_osd_at) { g_osd_at = 0; kbd_tap(KEY_F12); }
+}
+
+/* ---- the loop ---- */
+static void *pmenu(void *arg) {
+    (void)arg;
+    cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(1, &cs);
+    pthread_setaffinity_np(pthread_self(), sizeof cs, &cs);
+    R.buf = malloc((size_t)TRING * 16);
+    mkdir(REPLAYS_ROOT, 0755); mkdir(REPLAYS, 0755);
+    kbd_open();
+    volatile uint8_t *mreq = g_mbox + PM_MREQ, *mrsp = g_mbox + PM_MRSP;
+    uint64_t m = rd64(mreq);
+    uint8_t ans = (m >> 56) == 0x4D ? (uint8_t)(m >> 24) : 0;   /* never run a request left from before */
+    uint8_t hb = 0, slots = 0;
+    int result = 0, notice = 0;
+    double t_hb = 0, t_slots = 0;
+    uint32_t crc_seen = 0;
+    char game[64] = "";
+    while (!g_stop) {
+        double t = now_ms();
+        m = rd64(mreq);
+        int answered = 0;
+        if ((m >> 56) == 0x4D) {
+            int mv = (m >> 16) & 15, sv = (m >> 20) & 15;
+            g_user_bvol = mv > 10 ? 10 : mv;
+            g_user_svol = sv > 10 ? 10 : sv;
+            uint8_t seq = (uint8_t)(m >> 24), a = (uint8_t)m, arg = (uint8_t)(m >> 8);
+            if (seq != ans) {
+                result = 0; notice = 0;
+                switch (a) {
+                case A_LIST: list_packs(); break;
+                case A_LOAD:
+                    if (arg >= g_npack || g_pack_loading) { result = 1; notice = PMN_PACKFAIL; break; }
+                    else {
+                        pthread_t th; char *p = strdup(g_pack[arg]);
+                        g_pack_loading = 1;
+                        if (!p || pthread_create(&th, NULL, pack_load_thread, p)) {
+                            free(p); g_pack_loading = 0; result = 1; notice = PMN_PACKFAIL;
+                        } else pthread_detach(th);
+                    }
+                    break;
+                case A_RECORD:
+                    notice = take_start((arg & 7) + 1, (arg >> 3) & 1);
+                    result = notice ? 1 : 0;
+                    break;
+                case A_STOP:    notice = take_stop(&result); break;
+                case A_PLAY:    notice = take_play((arg & 7) + 1, &result); break;
+                case A_DISCARD: take_drop(); break;
+                case A_QUIT:
+                    if (arg & 1) take_drop();
+                    g_quit_at = t + 200;                 /* after the answer reaches the core */
+                    break;
+                default: result = 1; break;
+                }
+                ans = seq; answered = 1;
+                if (a == A_STOP) t_slots = 0;            /* recount now */
+            }
+        }
+        take_capture();
+        play_disarm_check();
+        quit_step();
+        uint32_t crc = (uint32_t)rd64(g_trec + 8);
+        if (t - t_slots >= 1000 || crc != crc_seen) {    /* the slots used by this ROM */
+            crc_seen = crc; t_slots = t;
+            game_name(game, sizeof game, crc);
+            slots = slots_used(game);
+        }
+        if (t - t_hb >= 100) { hb++; t_hb = t; answered = 1; }
+        if (answered) {
+            __sync_synchronize();                        /* names land before the answer */
+            wr64(mrsp, 0xA7ull << 56 | (uint64_t)g_listgen << 48 | (uint64_t)slots << 40 |
+                       (uint64_t)g_npack << 32 | (uint64_t)(notice & 63) << 24 |
+                       (uint64_t)result << 16 | (uint64_t)ans << 8 | hb);
+        }
+        usleep(20000);
+    }
+    if (g_kbd >= 0) { ioctl(g_kbd, UI_DEV_DESTROY); close(g_kbd); }
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     int stats = 300, once = 0, lag = 1;
     for (int i = 1; i < argc; i++) {
@@ -580,6 +1220,9 @@ int main(int argc, char **argv) {
     volatile uint8_t *mbox = map(MBOX_PA, 0x1000);
     g_pk = pk; g_mbox = mbox; g_rf = map(RF_PA, 2 * RF_MAXB);
     g_aud = map(AUD_PA, AUD_LEN); g_ovf = map(OVF_PA, PACK_MAX);
+    g_trec = map(TREC_PA, 0x1000); g_tplay = map(TPLAY_PA, 0x1000);
+    g_tent = map(TENT_PA, TRING * 16); g_tpent = map(TPENT_PA, TRING * 16);
+    g_bat = map(BAT_PA, BAT_MAP);
     {   /* the display-list loop on core 0, the core with the faster DDR3 reads (its decision
            time is measured there, hdarm4.c); the two threads below put themselves on core 1 */
         cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(0, &cs);
@@ -588,8 +1231,9 @@ int main(int argc, char **argv) {
     g_lists = lists; g_recs = recs;
     g_last = malloc(LIST_LEN);          /* the pacer's copy of the last published list */
     if (!g_last) { fprintf(stderr, "hdarm: out of memory\n"); return 1; }
-    pthread_t svc, aud, pac, ldr;
+    pthread_t svc, aud, pac, ldr, pmt;
     if (pthread_create(&svc, NULL, service, NULL)) { perror("pthread_create"); return 1; }
+    if (pthread_create(&pmt, NULL, pmenu, NULL)) { perror("pthread_create"); return 1; }
     if (pthread_create(&aud, NULL, audio, NULL)) { perror("pthread_create"); return 1; }
     if (pthread_create(&ldr, NULL, loader, NULL)) { perror("pthread_create"); return 1; }
     if (!once && pthread_create(&pac, NULL, pacer, NULL)) { perror("pthread_create"); return 1; }
@@ -700,6 +1344,7 @@ int main(int argc, char **argv) {
     pthread_join(svc, NULL);
     pthread_join(aud, NULL);
     pthread_join(ldr, NULL);
+    pthread_join(pmt, NULL);
     if (!once) pthread_join(pac, NULL);
     fprintf(stderr, "hdarm: stopped after %u frames\n", n);
     return 0;

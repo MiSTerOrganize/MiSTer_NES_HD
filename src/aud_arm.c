@@ -44,6 +44,14 @@ static int vol(int x, int v) {
     return p < 0 ? -q : q;
 }
 
+/* the pause menu's volume u (0..10) on a sample; 10 leaves it exactly as Mesen plays it */
+static int uvol(int x, int u) {
+    if (u >= 10) return x;
+    if (u <= 0) return 0;
+    int p = x * u, q = (p < 0 ? -p : p) / 10;
+    return p < 0 ? -q : q;
+}
+
 static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 static uint64_t le64(const uint8_t *p) { return le32(p) | (uint64_t)le32(p + 4) << 32; }
 
@@ -116,7 +124,10 @@ static void free_section(aud_arm *a) {
     a->ckb_e = 0; a->ckb.on = 0; a->ck_loaded = 0;
 }
 
-void aud_init(aud_arm *a) { memset(a, 0, sizeof *a); power_on(a); }
+void aud_init(aud_arm *a) {
+    memset(a, 0, sizeof *a); power_on(a);
+    a->user_bvol = a->user_svol = 10;
+}
 void aud_free(aud_arm *a) { free_section(a); }
 
 /* The section's checkpoint table (hdaudio.build_section, since 2026-10-29): at section byte
@@ -296,7 +307,8 @@ void aud_tick(aud_arm *a, uint32_t out[AUD_NV]) {
         if (!voice_next(a, &a->bgm, &l, &r)) {
             a->bgm.on = 0;
         } else {
-            out[0] = (uint32_t)(vol(r, a->bvol) & 0xFFFF) << 16 | (vol(l, a->bvol) & 0xFFFF);
+            out[0] = (uint32_t)(vol(uvol(r, a->user_bvol), a->bvol) & 0xFFFF) << 16 |
+                     (vol(uvol(l, a->user_bvol), a->bvol) & 0xFFFF);
             if (a->bgm.pos >= a->ent[a->bgm.e].frames && !a->bgm.loop) a->bgm.on = 0;
         }
     }
@@ -305,7 +317,8 @@ void aud_tick(aud_arm *a, uint32_t out[AUD_NV]) {
     for (int i = 0; i < a->n_sfx; i++) {
         aud_voice *v = &a->sfx[i];
         if (!voice_next(a, v, &l, &r)) continue;
-        out[1 + i] = (uint32_t)(vol(r, a->svol) & 0xFFFF) << 16 | (vol(l, a->svol) & 0xFFFF);
+        out[1 + i] = (uint32_t)(vol(uvol(r, a->user_svol), a->svol) & 0xFFFF) << 16 |
+                     (vol(uvol(l, a->user_svol), a->svol) & 0xFFFF);
         if (v->pos < a->ent[v->e].frames) {
             if (keep != i) a->sfx[keep] = *v;
             keep++;

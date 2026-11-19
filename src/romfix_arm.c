@@ -178,6 +178,15 @@ uint32_t rf_build(const uint8_t *s14, uint32_t plen, const uint8_t *e, const uin
 }
 
 /* ---------------------------------------------------------------- decision */
+/* rf_decide's three tries without the build: is this ROM one section 14 patches? */
+int rf_match(const uint8_t *s14, uint32_t s14_len, const uint8_t *rom, uint32_t L,
+             const uint8_t sha_raw[20], const uint8_t *sha_n) {
+    if (!s14 || s14_len < 64) return 0;
+    if (search(s14, s14_len, sha_raw) >= 0) return 1;
+    if (sha_n && search(s14, s14_len, sha_n) >= 0) return 1;
+    return rom && search_rule(s14, s14_len, rom, L) >= 0;
+}
+
 void rf_init(rf_state *st) { memset(st, 0, sizeof *st); }
 
 int rf_session_check(rf_state *st, uint64_t cmd_now) {
